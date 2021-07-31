@@ -6,8 +6,6 @@
   "isBase64Encoded": false,
   "queryStringParameters": {
     "objective": "ap",
-    "fields": "quests",
-    "quest_fields": "ap,bp",
     "items": "00:100,03:100",
     "quests": "1,2,3"
   },
