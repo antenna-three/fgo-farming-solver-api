@@ -197,10 +197,8 @@ def format_value(variables):
 def format_result(item_counts, quest_laps, params, items, quests, key):
     if not params['fields']:
         params['fields'] = ['quests', 'items']
-    if params['quest_fields']:
-        quest_to_info = {quest[key]: quest for quest in quests}
-    if params['item_fields']:
-        item_to_info = {item[key]: item for item in items}
+    quest_to_info = {quest[key]: quest for quest in quests}
+    item_to_info = {item[key]: item for item in items}
 
     result = {}
     if 'quests' in params['fields']:
@@ -225,6 +223,12 @@ def format_result(item_counts, quest_laps, params, items, quests, key):
             )
             for item, count in item_counts.items()
         ]
+    if 'total_lap' in params['fields']:
+        result['total_lap'] = sum(math.ceil(lap) for lap in quest_laps.values())
+    if 'total_ap' in params['fields']:
+        for quest in quest_laps.keys():
+            print(quest, quest_to_info[quest]['ap'])
+        result['total_ap'] = sum(int(quest_to_info[quest]['ap'] * lap) for quest, lap in quest_laps.items())
     return result
 
 class ParamError(Exception):
