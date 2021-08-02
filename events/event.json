@@ -6,8 +6,8 @@
   "isBase64Encoded": false,
   "queryStringParameters": {
     "objective": "ap",
-    "items": "00:100,03:100",
-    "quests": "1,2,3"
+    "items": "00:100,01:100,02:100,03:100,08:100",
+    "ap_coefficients": "0:0.01"
   },
   "pathParameters": {
     "proxy": "/path/to/resource"

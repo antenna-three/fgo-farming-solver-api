@@ -13,12 +13,13 @@ def handler(event, context):
     if params is None:
         return {
             'usage': {
-                'fields': ['quests', 'items'],
-                'quest_fields': list(quests[0].keys()),
-                'item_fields': list(items[0].keys()),
+                'fields': 'string,string,...',
+                'quest_fields': 'string,string,...',
+                'item_fields': 'string,string,...',
                 'objective': "'ap' or 'qp'",
-                'items': {item['item']: 0 for item in items},
-                'quests': [quest['quest'] for quest in quests]
+                'items': 'string:int,string:int,...',
+                'quests': 'string,string,...',
+                'ap_coefficients': 'string:float,string:float,...'
             }
         }
     params = decode_params(
@@ -29,13 +30,15 @@ def handler(event, context):
         objective=['ap', 'lap'],
         items='dict',
         quests='list',
+        ap_coefficients='dict',
     )
     items, quests, drop_rates = get_data('items', 'quests', 'drop_rates')
     try:
         key = get_key(params['items'])
-        param_items = format_param_items(items, params['items'])
-        if params['quests']:
-            quests = filter_quests(quests, params['quests'], key)
+        param_items = format_param_items(params['items'])
+        ap_coefficients = format_ap_coefficients(params['ap_coefficients'])
+        if params['quests'] or params['ap_coefficients']:
+            quests = filter_quests(quests, params['quests'], key, ap_coefficients)
         quest_keys = [quest[key] for quest in quests]
         drop_rates = filter_drop_rates(drop_rates, param_items, quest_keys, key)
         item_counts, quest_laps = solve(params['objective'], param_items, quests, drop_rates, key)
@@ -101,7 +104,7 @@ def get_key(param_items):
     else:
         return 'name'
 
-def format_param_items(items, param_items):
+def format_param_items(param_items):
     try:
         param_items = {item: int(count) for item, count in param_items.items()}
     except ValueError:
@@ -114,7 +117,20 @@ def format_param_items(items, param_items):
         )
     return param_items
 
-def filter_quests(quests, param_quests, key):
+def format_ap_coefficients(ap_coefficients):
+    try:
+        ap_coefficients = {quest: float(ap_coefficient) for quest, ap_coefficient in ap_coefficients.items()}
+    except ValueError:
+        raise ParamError(
+            message='Numbers of ap_coefficients must be positive floats',
+            invalid_params={
+                'name': 'ap_coefficient',
+                'reason': 'must be like "string:float,string:float,..."'
+            }
+        )
+    return ap_coefficients
+
+def filter_quests(quests, param_quests, key, ap_coefficients):
     if key == 'id':
         get_area = lambda quest: quest['id'][:2]
         get_section = lambda quest: quest['id'][0]
@@ -122,12 +138,20 @@ def filter_quests(quests, param_quests, key):
         get_area = lambda quest: quest['area']
         get_section = lambda quest: quest['section']
 
-    quests = [
-        quest for quest in quests
-        if quest[key] in param_quests
-        or get_area(quest) in param_quests
-        or get_section(quest) in param_quests
-    ]
+    if param_quests:
+        quests = [
+            quest for quest in quests
+            if quest[key] in param_quests
+            or get_area(quest) in param_quests
+            or get_section(quest) in param_quests
+        ]
+    for quest in quests:
+        quest['ap'] = float(quest['ap']) * (
+            ap_coefficients.get(quest[key])
+            or ap_coefficients.get(get_area(quest))
+            or ap_coefficients.get(get_section(quest))
+            or 1
+        )
     return quests
 
 def filter_drop_rates(drop_rates, items, quests, key):
@@ -144,7 +168,7 @@ def solve(objective, items, quests, drop_rates, key):
     if objective == 'lap':
         problem.setObjective(pulp.lpSum(quest_lap_variables.values()))
     elif objective == 'ap':
-        problem.setObjective(pulp.lpSum(int(quest['ap']) * quest_lap_variables[quest['id']] for quest in quests))
+        problem.setObjective(pulp.lpSum(quest['ap'] * quest_lap_variables[quest['id']] for quest in quests))
     ig = itemgetter('item_' + key)
     item_count_expressions = {
         item: pulp.LpAffineExpression(
