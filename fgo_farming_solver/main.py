@@ -48,7 +48,7 @@ def handler(event, context):
         quests = filter_quests(quests, params['quests'], params['ap_coefficients'])
         quest_ids = [quest['id'] for quest in quests]
         drop_rates = filter_drop_rates(drop_rates, params['items'], quest_ids)
-        item_counts, quest_laps = solve(params['objective'], params['items'], quests, drop_rates)
+        item_counts, quest_laps = solve(params['objective'], params['items'], items, quests, drop_rates)
         item_counts = format_value(item_counts)
         quest_laps = format_value(quest_laps)
         result = format_result(item_counts, quest_laps, items, quests, drop_rates, params)
@@ -192,11 +192,10 @@ def merge_drop_rates(drop_rates, quests, drop_merge_method):
 def filter_drop_rates(drop_rates, items, quests):
     return [
         row for row in drop_rates
-        if row['item_id'] in items 
-        and row['quest_id'] in quests
+        if row['quest_id'] in quests
     ]
 
-def solve(objective, items, quests, drop_rates):
+def solve(objective, param_items, items, quests, drop_rates):
     quest_ids = [quest['id'] for quest in quests]
     problem = pulp.LpProblem(sense=pulp.LpMinimize)
     quest_lap_variables = pulp.LpVariable.dicts('lap', quest_ids, lowBound=0)
@@ -216,7 +215,8 @@ def solve(objective, items, quests, drop_rates):
         for item, group in groupby(sorted(drop_rates, key=ig), key=ig)
     }
     for item, expression in item_count_expressions.items():
-        problem.addConstraint(pulp.LpConstraint(expression, pulp.LpConstraintGE, rhs=items[item]))
+        if item in param_items:
+            problem.addConstraint(pulp.LpConstraint(expression, pulp.LpConstraintGE, rhs=param_items[item]))
 
     problem.solve()
 
