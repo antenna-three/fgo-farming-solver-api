@@ -1,11 +1,13 @@
-import csv
 import json
 from itertools import groupby
 from operator import itemgetter
 import pulp
 import math
 from io import StringIO
+import uuid
 import boto3
+from decimal import Decimal
+from pathlib import Path
 import traceback
 
 def handler(event, context):
@@ -19,7 +21,8 @@ def handler(event, context):
                 'objective': "'ap' or 'qp'",
                 'items': 'string:int,string:int,...',
                 'quests': 'string,string,...',
-                'ap_coefficients': 'string:float,string:float,...'
+                'ap_coefficients': 'string:float,string:float,...',
+                'drop_merge_method': "'1' or '2' or 'add'"
             }
         }
     params = decode_params(
@@ -27,24 +30,33 @@ def handler(event, context):
         fields='list',
         quest_fields='list',
         item_fields='list',
-        objective=['ap', 'lap'],
+        objective='ap',
         items='dict',
         quests='list',
         ap_coefficients='dict',
+        drop_merge_method='add'
     )
-    items, quests, drop_rates = get_data('items', 'quests', 'drop_rates')
+    data = get_data()
+    items = data['items']
+    quests = data['quests']
+    drop_rates = data['drop_rates']
     try:
-        key = get_key(params['items'])
-        param_items = format_param_items(params['items'])
-        ap_coefficients = format_ap_coefficients(params['ap_coefficients'])
-        if params['quests'] or params['ap_coefficients']:
-            quests = filter_quests(quests, params['quests'], key, ap_coefficients)
-        quest_keys = [quest[key] for quest in quests]
-        drop_rates = filter_drop_rates(drop_rates, param_items, quest_keys, key)
-        item_counts, quest_laps = solve(params['objective'], param_items, quests, drop_rates, key)
+        params['items'] = format_param_items(params['items'])
+        params['ap_coefficients'] = format_ap_coefficients(params['ap_coefficients'])
+        quests = format_quests(quests)
+        drop_rates = merge_drop_rates(drop_rates, quests, params['drop_merge_method'])
+        quests = filter_quests(quests, params['quests'], params['ap_coefficients'])
+        quest_ids = [quest['id'] for quest in quests]
+        drop_rates = filter_drop_rates(drop_rates, params['items'], quest_ids)
+        item_counts, quest_laps = solve(params['objective'], params['items'], quests, drop_rates)
         item_counts = format_value(item_counts)
         quest_laps = format_value(quest_laps)
-        result = format_result(item_counts, quest_laps, params, items, quests, key)
+        result = format_result(item_counts, quest_laps, items, quests, drop_rates, params)
+        if 'id' in params['fields']:
+            uuid_ = uuid.uuid1()
+            result['id'] = str(uuid_)
+            save_to_dynamodb(result)
+        result = filter_result(result, params)
     except ParamError as e:
         return {
             'statusCode': 400,
@@ -65,15 +77,7 @@ def decode_params(params, **keys):
     values = {}
     for key, type_ in keys.items():
         value = params.get(key)
-        if type_ is list and value not in type_:
-            raise ParamError(
-                title=f'Specify {value}',
-                invalid_params=[{
-                    'name': value,
-                    'reason': f'must be {" or ".join(type_)}'
-                }]
-            )
-        elif type_ == 'list':
+        if type_ == 'list':
             if value:
                 value = value.split(',')
             else:
@@ -83,19 +87,20 @@ def decode_params(params, **keys):
                 value = dict(item.split(':') for item in value.split(','))
             else:
                 value = {}
+        else:
+            if not value:
+                value = type_
         values[key] = value
     return values
 
-def get_data(*keys):
+def get_data():
     s3 = boto3.resource('s3')
-    data = []
-    for key in keys:
-        obj = s3.Object('fgodrop', key + '.csv')
-        response = obj.get()
-        body = response['Body'].read()
-        with StringIO(body.decode('utf-8'), newline='') as s:
-            reader = csv.DictReader(s)
-            data.append(list(reader))
+    path = Path('/tmp/all.json')
+    if not path.exists():
+        obj = s3.Object('fgodrop', 'all.json')
+        obj.download_file(str(path))
+    with path.open('r', encoding='utf-8') as f:
+        data = json.load(f)
     return data
 
 def get_key(param_items):
@@ -130,50 +135,80 @@ def format_ap_coefficients(ap_coefficients):
         )
     return ap_coefficients
 
-def filter_quests(quests, param_quests, key, ap_coefficients):
-    if key == 'id':
-        get_area = lambda quest: quest['id'][:2]
-        get_section = lambda quest: quest['id'][0]
-    else:
-        get_area = lambda quest: quest['area']
-        get_section = lambda quest: quest['section']
+def format_quests(quests):
+    keys = ('section', 'area', 'name', 'id')
+    return [
+        {
+            key: value if key in keys else int(value) if value else None
+            for key, value in quest.items()
+        }
+        for quest in quests
+    ]
+
+def filter_quests(quests, param_quests, ap_coefficients):
+    get_area = lambda quest: quest['id'][:2]
+    get_section = lambda quest: quest['id'][0]
 
     if param_quests:
         quests = [
             quest for quest in quests
-            if quest[key] in param_quests
+            if quest['id'] in param_quests
             or get_area(quest) in param_quests
             or get_section(quest) in param_quests
         ]
     for quest in quests:
-        quest['ap'] = float(quest['ap']) * (
-            ap_coefficients.get(quest[key])
+        ap_coefficient = (
+            ap_coefficients.get(quest['id'])
             or ap_coefficients.get(get_area(quest))
             or ap_coefficients.get(get_section(quest))
             or 1
         )
+        quest['ap'] = math.floor(quest['ap'] * ap_coefficient)
     return quests
 
-def filter_drop_rates(drop_rates, items, quests, key):
+def merge_drop_rates(drop_rates, quests, drop_merge_method):
+    drop_rates = drop_rates.copy()
+    if drop_merge_method == 'add':
+        samples_1s = {row['id']: row['samples_1'] for row in quests}
+        samples_2s = {row['id']: row['samples_2'] for row in quests}
+        for row in drop_rates:
+            samples_1 = samples_1s[row['quest_id']] or 0
+            samples_2 = samples_2s[row['quest_id']] or 0
+            drop_rate_1, drop_rate_2 = row.pop('drop_rate_1', 0), row.pop('drop_rate_2', 0)
+            if samples_1 or samples_2:
+                row['drop_rate'] = (drop_rate_1*samples_1 + drop_rate_2*samples_2) / (samples_1 + samples_2)
+            else:
+                row['drop_rate'] = 0
+    else:
+        primary = drop_merge_method
+        secondary = '1' if primary == '2' else '2'
+        for row in drop_rates:
+            drop_rate_primary = row.pop('drop_rate_' + primary, 0)
+            drop_rate_secondary = row.pop('drop_rate_' + secondary, 0)
+            row['drop_rate'] = drop_rate_primary or drop_rate_secondary
+    return drop_rates
+
+
+def filter_drop_rates(drop_rates, items, quests):
     return [
         row for row in drop_rates
-        if row['item_' + key] in items 
-        and row['quest_' + key] in quests
+        if row['item_id'] in items 
+        and row['quest_id'] in quests
     ]
 
-def solve(objective, items, quests, drop_rates, key):
-    quest_keys = [quest[key] for quest in quests]
+def solve(objective, items, quests, drop_rates):
+    quest_ids = [quest['id'] for quest in quests]
     problem = pulp.LpProblem(sense=pulp.LpMinimize)
-    quest_lap_variables = pulp.LpVariable.dicts('lap', quest_keys, lowBound=0)
+    quest_lap_variables = pulp.LpVariable.dicts('lap', quest_ids, lowBound=0)
     if objective == 'lap':
         problem.setObjective(pulp.lpSum(quest_lap_variables.values()))
     elif objective == 'ap':
         problem.setObjective(pulp.lpSum(quest['ap'] * quest_lap_variables[quest['id']] for quest in quests))
-    ig = itemgetter('item_' + key)
+    ig = itemgetter('item_id')
     item_count_expressions = {
         item: pulp.LpAffineExpression(
             {
-                quest_lap_variables[row['quest_' + key]]: float(row['drop_rate'])
+                quest_lap_variables[row['quest_id']]: float(row['drop_rate'])
                 for row in group
             },
             name=item
@@ -194,41 +229,62 @@ def format_value(variables):
         if (value:=pulp.value(variable)) > 0
     }
 
-def format_result(item_counts, quest_laps, params, items, quests, key):
-    if not params['fields']:
-        params['fields'] = ['quests', 'items']
-    quest_to_info = {quest[key]: quest for quest in quests}
-    item_to_info = {item[key]: item for item in items}
+def format_result(item_counts, quest_laps, items, quests, drop_rates, params):
+    quest_to_info = {quest['id']: quest for quest in quests}
+    item_to_info = {item['id']: item for item in items}
 
-    result = {}
-    if 'quests' in params['fields']:
-        result['quests'] = [
-            dict(
+    result = {
+        'params': {
+            k: v for k, v in params.items()
+            if v and 'fields' not in k
+        },
+        'quests': [
+            {
                 **{
-                    key: quest,
+                    'id': quest,
                     'lap': math.ceil(lap)
                 },
-                **{k: quest_to_info[quest].get(k, '') for k in params['quest_fields']}
-            )
+                **quest_to_info[quest],
+            }
             for quest, lap in quest_laps.items()
-        ]
-    if 'items' in params['fields']:
-        result['items'] = [
-            dict(
+        ],
+        'items': [
+            {
                 **{
-                    key: item,
+                    'id': item,
                     'count': round(count)
                 },
-                **{k: item_to_info[item].get(k, '') for k in params['item_fields']}
-            )
+                **item_to_info[item],
+            }
             for item, count in item_counts.items()
-        ]
-    if 'total_lap' in params['fields']:
-        result['total_lap'] = sum(math.ceil(lap) for lap in quest_laps.values())
-    if 'total_ap' in params['fields']:
-        for quest in quest_laps.keys():
-            print(quest, quest_to_info[quest]['ap'])
-        result['total_ap'] = sum(int(quest_to_info[quest]['ap'] * lap) for quest, lap in quest_laps.items())
+        ],
+        'drop_rates': [
+            row for row in drop_rates
+            if row['quest_id'] in quest_laps
+        ],
+        'total_lap': sum(math.ceil(lap) for lap in quest_laps.values()),
+        'total_ap': sum(int(quest_to_info[quest]['ap'] * lap) for quest, lap in quest_laps.items())
+    }
+    return result
+
+def save_to_dynamodb(result):
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table('fgo-farming-solver-results')
+    item = result.copy()
+    item['params']['ap_coefficients'] = {k: Decimal(v) for k, v in item['params']['ap_coefficients'].items()}
+    item['drop_rates'] = [
+        {k: Decimal(str(v)) if k == 'drop_rate' else v for k, v in row.items()}
+        for row in item['drop_rates']
+    ]
+    table.put_item(Item=item)
+
+def filter_result(result, params):
+    if params['fields']:
+        if params['quest_fields']:
+            result['quests'] = {k: v for k, v in result['quests'].items() if k in params['quest_fields']}
+        if params['item_fields']:
+            result['items'] = {k: v for k, v in result['items'].items() if k in params['item_fields']}
+        result = {k: v for k, v in result.items() if k in params['fields']}
     return result
 
 class ParamError(Exception):

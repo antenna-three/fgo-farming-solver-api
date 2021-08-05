@@ -8,7 +8,7 @@ Description: >
 # More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
   Function:
-    Timeout: 10
+    Timeout: 30
 
 Resources:
   FgoFarmingSolverFunction:
@@ -26,6 +26,22 @@ Resources:
       Policies:
         - S3ReadPolicy:
             BucketName: fgodrop
+        - DynamoDBWritePolicy:
+            TableName: fgo-farming-solver-results
+  FgoFarmingSolverResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: fgo-farming-solver-results
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
           
 
 Outputs:
