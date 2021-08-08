@@ -1,14 +1,26 @@
+import time
+import resource
+
+records = {}
+
+def measure(s=''):
+    records[s] = resource.getrusage(resource.RUSAGE_SELF)
+
+measure('start import')
+
+import boto3
+import tarfile
+import csv
 import json
+import uuid
+import math
+from pathlib import Path
+from decimal import Decimal
 from itertools import groupby
 from operator import itemgetter
-import pulp
-import math
-from io import StringIO
-import uuid
-import boto3
-from decimal import Decimal
-from pathlib import Path
-import traceback
+
+measure('end import')
+
 
 def handler(event, context):
     params = event.get('queryStringParameters')
@@ -27,123 +39,126 @@ def handler(event, context):
         }
     params = decode_params(
         params,
-        fields='list',
-        quest_fields='list',
-        item_fields='list',
+        fields=[],
+        quest_fields=[],
+        item_fields=[],
         objective='ap',
-        items='dict',
-        quests='list',
-        ap_coefficients='dict',
+        items={},
+        quests=[],
+        ap_coefficients={},
         drop_merge_method='add'
     )
-    data = get_data()
-    items = data['items']
-    quests = data['quests']
-    drop_rates = data['drop_rates']
     try:
-        params['items'] = format_param_items(params['items'])
-        params['ap_coefficients'] = format_ap_coefficients(params['ap_coefficients'])
-        quests = format_quests(quests)
-        drop_rates = merge_drop_rates(drop_rates, quests, params['drop_merge_method'])
-        quests = filter_quests(quests, params['quests'], params['ap_coefficients'])
-        quest_ids = [quest['id'] for quest in quests]
-        drop_rates = filter_drop_rates(drop_rates, params['items'], quest_ids)
-        item_counts, quest_laps = solve(params['objective'], params['items'], items, quests, drop_rates)
-        item_counts = format_value(item_counts)
-        quest_laps = format_value(quest_laps)
-        result = format_result(item_counts, quest_laps, items, quests, drop_rates, params)
-        if 'id' in params['fields']:
-            uuid_ = uuid.uuid1()
-            result['id'] = str(uuid_)
-            save_to_dynamodb(result)
-        result = filter_result(result, params)
+        validate_params(params, objective=('ap', 'lap'), drop_merge_method=('add', '1', '2'))
+        params = format_params(params, items=int, ap_coefficients=float)
     except ParamError as e:
         return {
             'statusCode': 400,
             'body': json.dumps(e.body)
         }
-    except Exception as e:
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'message': traceback.format_exc()})
-        }
-    else:
-        return {
-            'statusCode': 200,
-            'body': json.dumps(result, ensure_ascii=False)
-        }
+
+    items, quests, drop_rates = get_data('items', 'quests', 'drop_rates')
+    quests = format_rows(quests, ap=int, bp=int, exp=int, qp=int, samples_1=int, samples_2=int)
+    drop_rates = format_rows(drop_rates, drop_rate_1=float, drop_rate_2=float)
+
+    quests = filter_quests(quests, params['quests'], params['ap_coefficients'])
+    drop_rates = filter_drop_rates(drop_rates, quests)
+    drop_rates = merge_drop_rates(drop_rates, quests, params['drop_merge_method'])
+
+    item_counts, quest_laps = solve(params['objective'], params['items'], quests, drop_rates)
+    result = format_result(item_counts, quest_laps, items, quests, drop_rates, params)
+    measure('start put dynamodb')
+    if 'id' in params['fields']:
+        result['id'] = str(uuid.uuid1())
+        save_to_dynamodb(result)
+    measure('end put dynamodb')
+    result = filter_result(result, params)
+
+    for key, value in records.items():
+        print(f'[{key}]\ntime: {value[0]}s\nmemory: {value[2]/1024.0:.1f}mb')
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(result, ensure_ascii=False)
+    }
+
 
 def decode_params(params, **keys):
     values = {}
-    for key, type_ in keys.items():
+    for key, default in keys.items():
         value = params.get(key)
-        if type_ == 'list':
-            if value:
-                value = value.split(',')
-            else:
-                value = []
-        elif type_ == 'dict':
-            if value:
-                value = dict(item.split(':') for item in value.split(','))
-            else:
-                value = {}
-        else:
-            if not value:
-                value = type_
+        if not value:
+            value = default
+        elif default == []:
+            value = value.split(',')
+        elif default == {}:
+            value = dict(item.split(':') for item in value.split(','))
         values[key] = value
     return values
 
-def get_data():
+
+def validate_params(params, **values):
+    for key, choices in values.items():
+        if (value:=params.get(key, '')) not in choices:
+            raise ParamError(
+                message=key + ' is invalid',
+                params=params,
+                invalid_params={
+                    'name': key,
+                    'value': value,
+                    'reason': 'must be ' + ' or '.join(choices)
+                }
+            )
+
+
+def format_params(params, **formatters):
+    params = params.copy()
+    for key, formatter in formatters.items():
+        try:
+            params[key] = {k: formatter(v) for k, v in params[key].items()}
+        except ValueError:
+            raise ParamError(
+                message=f'Numbers of {key} is invalid',
+                params=params,
+                invalid_params={
+                    'name': key,
+                    'reason': f'must be like "string:number,string:number,..."'
+                }
+            )
+    return params
+
+
+def get_data(*keys):
     s3 = boto3.resource('s3')
-    path = Path('/tmp/all.json')
-    if not path.exists():
-        obj = s3.Object('fgodrop', 'all.json')
-        obj.download_file(str(path))
-    with path.open('r', encoding='utf-8') as f:
-        data = json.load(f)
+    tar_path = Path('/tmp/all.tar.gz')
+    dst_path = Path('/tmp/all')
+    measure('start download')
+    if not tar_path.exists():
+        obj = s3.Object('fgodrop', 'all.tar.gz')
+        obj.download_file(str(tar_path))
+    measure('end download, start extract')
+    with tarfile.open(tar_path, 'r') as t:
+        t.extractall(dst_path)
+    measure('end extract, start read')
+    data = []
+    for key in keys:
+        rows = []
+        with open(dst_path / (key + '.csv'), 'r', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+        data.append(rows)
+    measure('end read')
     return data
 
-def get_key(param_items):
-    if all(len(k) == len(str.encode(k, 'utf-8')) for k in param_items.keys()):
-        return 'id'
-    else:
-        return 'name'
 
-def format_param_items(param_items):
-    try:
-        param_items = {item: int(count) for item, count in param_items.items()}
-    except ValueError:
-        raise ParamError(
-            message='Numbers of items must be positive integers',
-            invalid_params={
-                'name': 'item',
-                'reason': 'must be like "string:integer,string:integer,..."'
-            }
-        )
-    return param_items
-
-def format_ap_coefficients(ap_coefficients):
-    try:
-        ap_coefficients = {quest: float(ap_coefficient) for quest, ap_coefficient in ap_coefficients.items()}
-    except ValueError:
-        raise ParamError(
-            message='Numbers of ap_coefficients must be positive floats',
-            invalid_params={
-                'name': 'ap_coefficient',
-                'reason': 'must be like "string:float,string:float,..."'
-            }
-        )
-    return ap_coefficients
-
-def format_quests(quests):
-    keys = ('section', 'area', 'name', 'id')
+def format_rows(rows, **formatters):
     return [
         {
-            key: value if key in keys else int(value) if value else None
-            for key, value in quest.items()
+            key: formatters[key](value or 0) if key in formatters else value
+            for key, value in row.items()
         }
-        for quest in quests
+        for row in rows
     ]
+
 
 def filter_quests(quests, param_quests, ap_coefficients):
     get_area = lambda quest: quest['id'][:2]
@@ -166,14 +181,23 @@ def filter_quests(quests, param_quests, ap_coefficients):
         quest['ap'] = math.floor(quest['ap'] * ap_coefficient)
     return quests
 
+
+def filter_drop_rates(drop_rates, quests):
+    quest_ids = [row['id'] for row in quests]
+    return [
+        row for row in drop_rates
+        if row['quest_id'] in quest_ids
+    ]
+
+
 def merge_drop_rates(drop_rates, quests, drop_merge_method):
     drop_rates = drop_rates.copy()
     if drop_merge_method == 'add':
-        samples_1s = {row['id']: row['samples_1'] for row in quests}
-        samples_2s = {row['id']: row['samples_2'] for row in quests}
+        samples_1s = {row['id']: row.get('samples_1', 0) for row in quests}
+        samples_2s = {row['id']: row.get('samples_2', 0) for row in quests}
         for row in drop_rates:
-            samples_1 = samples_1s[row['quest_id']] or 0
-            samples_2 = samples_2s[row['quest_id']] or 0
+            samples_1 = samples_1s.get(row['quest_id'], 0)
+            samples_2 = samples_2s.get(row['quest_id'], 0)
             drop_rate_1, drop_rate_2 = row.pop('drop_rate_1', 0), row.pop('drop_rate_2', 0)
             if samples_1 or samples_2:
                 row['drop_rate'] = (drop_rate_1*samples_1 + drop_rate_2*samples_2) / (samples_1 + samples_2)
@@ -189,13 +213,9 @@ def merge_drop_rates(drop_rates, quests, drop_merge_method):
     return drop_rates
 
 
-def filter_drop_rates(drop_rates, items, quests):
-    return [
-        row for row in drop_rates
-        if row['quest_id'] in quests
-    ]
+def solve(objective, param_items, quests, drop_rates):
+    import pulp
 
-def solve(objective, param_items, items, quests, drop_rates):
     quest_ids = [quest['id'] for quest in quests]
     problem = pulp.LpProblem(sense=pulp.LpMinimize)
     quest_lap_variables = pulp.LpVariable.dicts('lap', quest_ids, lowBound=0)
@@ -207,7 +227,7 @@ def solve(objective, param_items, items, quests, drop_rates):
     item_count_expressions = {
         item: pulp.LpAffineExpression(
             {
-                quest_lap_variables[row['quest_id']]: float(row['drop_rate'])
+                quest_lap_variables[row['quest_id']]: row['drop_rate']
                 for row in group
             },
             name=item
@@ -220,16 +240,21 @@ def solve(objective, param_items, items, quests, drop_rates):
 
     problem.solve()
 
-    return item_count_expressions, quest_lap_variables
+    def format_value(variables):
+        return {
+            key: value
+            for key, variable in variables.items()
+            if (value:=pulp.value(variable)) > 0
+        }
 
-def format_value(variables):
-    return {
-        key: value
-        for key, variable in variables.items()
-        if (value:=pulp.value(variable)) > 0
-    }
+    item_counts = format_value(item_count_expressions)
+    quest_laps = format_value(quest_lap_variables)
+
+    return item_counts, quest_laps
+
 
 def format_result(item_counts, quest_laps, items, quests, drop_rates, params):
+
     quest_to_info = {quest['id']: quest for quest in quests}
     item_to_info = {item['id']: item for item in items}
 
@@ -267,16 +292,18 @@ def format_result(item_counts, quest_laps, items, quests, drop_rates, params):
     }
     return result
 
+
 def save_to_dynamodb(result):
     dynamodb = boto3.resource('dynamodb')
     table = dynamodb.Table('fgo-farming-solver-results')
     item = result.copy()
-    item['params']['ap_coefficients'] = {k: Decimal(v) for k, v in item['params']['ap_coefficients'].items()}
+    item['params']['ap_coefficients'] = {k: Decimal(str(v)) for k, v in item['params'].get('ap_coefficients', {}).items()}
     item['drop_rates'] = [
-        {k: Decimal(str(v)) if k == 'drop_rate' else v for k, v in row.items()}
+        {k: Decimal(str(round(v, 3))) if k == 'drop_rate' else v for k, v in row.items()}
         for row in item['drop_rates']
     ]
     table.put_item(Item=item)
+
 
 def filter_result(result, params):
     if params['fields']:
@@ -286,6 +313,7 @@ def filter_result(result, params):
             result['items'] = {k: v for k, v in result['items'].items() if k in params['item_fields']}
         result = {k: v for k, v in result.items() if k in params['fields']}
     return result
+
 
 class ParamError(Exception):
     def __init__(self, **body):
