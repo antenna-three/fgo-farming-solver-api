@@ -17,12 +17,17 @@ Resources:
       CodeUri: fgo_farming_solver/
       Handler: main.handler
       Runtime: python3.8
+      Environment:
+        Variables:
+          BUCKET_NAME: fgodrop
+          TABLE_NAME: fgo-farming-solver-results
       Events:
         FgoFarmingSolver:
           Type: HttpApi # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
           Properties:
             Path: /fgo-farming-solver
             Method: get
+      MemorySize: 1024
       Policies:
         - S3ReadPolicy:
             BucketName: fgodrop
@@ -40,8 +45,8 @@ Resources:
           KeyType: HASH
       BillingMode: PROVISIONED
       ProvisionedThroughput:
-        ReadCapacityUnits: 5
-        WriteCapacityUnits: 5
+        ReadCapacityUnits: 10
+        WriteCapacityUnits: 10
           
 
 Outputs:

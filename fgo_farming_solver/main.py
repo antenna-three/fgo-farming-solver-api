@@ -1,25 +1,13 @@
-import time
-import resource
-
-records = {}
-
-def measure(s=''):
-    records[s] = resource.getrusage(resource.RUSAGE_SELF)
-
-measure('start import')
-
+import os
 import boto3
-import tarfile
-import csv
+import gzip
 import json
-import uuid
 import math
 from pathlib import Path
+from time import time
 from decimal import Decimal
 from itertools import groupby
 from operator import itemgetter
-
-measure('end import')
 
 
 def handler(event, context):
@@ -57,9 +45,8 @@ def handler(event, context):
             'body': json.dumps(e.body)
         }
 
-    items, quests, drop_rates = get_data('items', 'quests', 'drop_rates')
-    quests = format_rows(quests, ap=int, bp=int, exp=int, qp=int, samples_1=int, samples_2=int)
-    drop_rates = format_rows(drop_rates, drop_rate_1=float, drop_rate_2=float)
+    data = get_data()
+    items, quests, drop_rates = data['items'], data['quests'], data['drop_rates']
 
     quests = filter_quests(quests, params['quests'], params['ap_coefficients'])
     drop_rates = filter_drop_rates(drop_rates, quests)
@@ -67,15 +54,11 @@ def handler(event, context):
 
     item_counts, quest_laps = solve(params['objective'], params['items'], quests, drop_rates)
     result = format_result(item_counts, quest_laps, items, quests, drop_rates, params)
-    measure('start put dynamodb')
     if 'id' in params['fields']:
-        result['id'] = str(uuid.uuid1())
-        save_to_dynamodb(result)
-    measure('end put dynamodb')
+        result['id'] = context.aws_request_id
+        result['unix_time'] = int(time())
+        put_dynamodb(result)
     result = filter_result(result, params)
-
-    for key, value in records.items():
-        print(f'[{key}]\ntime: {value[0]}s\nmemory: {value[2]/1024.0:.1f}mb')
     
     return {
         'statusCode': 200,
@@ -128,36 +111,20 @@ def format_params(params, **formatters):
     return params
 
 
-def get_data(*keys):
-    s3 = boto3.resource('s3')
-    tar_path = Path('/tmp/all.tar.gz')
-    dst_path = Path('/tmp/all')
-    measure('start download')
-    if not tar_path.exists():
-        obj = s3.Object('fgodrop', 'all.tar.gz')
-        obj.download_file(str(tar_path))
-    measure('end download, start extract')
-    with tarfile.open(tar_path, 'r') as t:
-        t.extractall(dst_path)
-    measure('end extract, start read')
-    data = []
-    for key in keys:
-        rows = []
-        with open(dst_path / (key + '.csv'), 'r', encoding='utf-8') as f:
-            rows = list(csv.DictReader(f))
-        data.append(rows)
-    measure('end read')
-    return data
+s3 = None
+obj = None
 
-
-def format_rows(rows, **formatters):
-    return [
-        {
-            key: formatters[key](value or 0) if key in formatters else value
-            for key, value in row.items()
-        }
-        for row in rows
-    ]
+def get_data():
+    global s3, obj
+    s3 = s3 or boto3.resource('s3')
+    bucket_name = os.getenv('BUCKET_NAME')
+    key = 'all.json.gz'
+    obj = obj or s3.Object(bucket_name, key)
+    gz_path = Path('/tmp/' + key)
+    if not gz_path.exists():
+        obj.download_file(str(gz_path))
+    with gzip.open(gz_path, 'rt', encoding='utf-8') as f:
+        return json.load(f)
 
 
 def filter_quests(quests, param_quests, ap_coefficients):
@@ -200,7 +167,10 @@ def merge_drop_rates(drop_rates, quests, drop_merge_method):
             samples_2 = samples_2s.get(row['quest_id'], 0)
             drop_rate_1, drop_rate_2 = row.pop('drop_rate_1', 0), row.pop('drop_rate_2', 0)
             if samples_1 or samples_2:
-                row['drop_rate'] = (drop_rate_1*samples_1 + drop_rate_2*samples_2) / (samples_1 + samples_2)
+                try:
+                    row['drop_rate'] = (drop_rate_1*samples_1 + drop_rate_2*samples_2) / (samples_1 + samples_2)
+                except TypeError:
+                    print(f'{drop_rate_1=}', f'{drop_rate_2=}', f'{samples_1=}', f'{samples_2=}')
             else:
                 row['drop_rate'] = 0
     else:
@@ -228,11 +198,11 @@ def solve(objective, param_items, quests, drop_rates):
         item: pulp.LpAffineExpression(
             {
                 quest_lap_variables[row['quest_id']]: row['drop_rate']
-                for row in group
+                for row in rows
             },
             name=item
         )
-        for item, group in groupby(sorted(drop_rates, key=ig), key=ig)
+        for item, rows in groupby(sorted(drop_rates, key=ig), key=ig)
     }
     for item, expression in item_count_expressions.items():
         if item in param_items:
@@ -254,7 +224,6 @@ def solve(objective, param_items, quests, drop_rates):
 
 
 def format_result(item_counts, quest_laps, items, quests, drop_rates, params):
-
     quest_to_info = {quest['id']: quest for quest in quests}
     item_to_info = {item['id']: item for item in items}
 
@@ -263,23 +232,17 @@ def format_result(item_counts, quest_laps, items, quests, drop_rates, params):
             k: v for k, v in params.items()
             if v and 'fields' not in k
         },
-        'quests': [
+        'quests': (quests:= [
             {
-                **{
-                    'id': quest,
-                    'lap': math.ceil(lap)
-                },
                 **quest_to_info[quest],
+                'lap': math.ceil(lap),
             }
             for quest, lap in quest_laps.items()
-        ],
+        ]),
         'items': [
             {
-                **{
-                    'id': item,
-                    'count': round(count)
-                },
                 **item_to_info[item],
+                'count': round(count),
             }
             for item, count in item_counts.items()
         ],
@@ -287,15 +250,21 @@ def format_result(item_counts, quest_laps, items, quests, drop_rates, params):
             row for row in drop_rates
             if row['quest_id'] in quest_laps
         ],
-        'total_lap': sum(math.ceil(lap) for lap in quest_laps.values()),
-        'total_ap': sum(int(quest_to_info[quest]['ap'] * lap) for quest, lap in quest_laps.items())
+        'total_lap': sum(quest['lap'] for quest in quests),
+        'total_ap': sum(quest['ap'] * quest['lap'] for quest in quests),
     }
     return result
 
 
-def save_to_dynamodb(result):
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('fgo-farming-solver-results')
+dynamodb = None
+table = None
+
+def put_dynamodb(result):
+    global dynamodb, table
+    endpoint_url = os.getenv('DYNAMODB_ENDPOINT')
+    dynamodb = dynamodb or boto3.resource('dynamodb', endpoint_url=endpoint_url)
+    table_name = os.getenv('TABLE_NAME')
+    table = table or dynamodb.Table(table_name)
     item = result.copy()
     item['params']['ap_coefficients'] = {k: Decimal(str(v)) for k, v in item['params'].get('ap_coefficients', {}).items()}
     item['drop_rates'] = [
