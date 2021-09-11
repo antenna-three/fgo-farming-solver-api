@@ -170,7 +170,7 @@ def merge_drop_rates(drop_rates, quests, drop_merge_method):
                 try:
                     row['drop_rate'] = (drop_rate_1*samples_1 + drop_rate_2*samples_2) / (samples_1 + samples_2)
                 except TypeError:
-                    print(f'{drop_rate_1=}', f'{drop_rate_2=}', f'{samples_1=}', f'{samples_2=}')
+                    print(f'{drop_rate_1=}, {drop_rate_2=}, {samples_1=}, {samples_2=}')
             else:
                 row['drop_rate'] = 0
     else:
@@ -235,7 +235,7 @@ def format_result(item_counts, quest_laps, items, quests, drop_rates, params):
         'quests': (quests:= [
             {
                 **quest_to_info[quest],
-                'lap': math.ceil(lap),
+                'lap': round(lap),
             }
             for quest, lap in quest_laps.items()
         ]),
