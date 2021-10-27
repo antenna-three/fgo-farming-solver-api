@@ -18,11 +18,12 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-northeast-1
-      - if: contains(env.GITHUB_REF, '/main')
+      - run: echo ${{ github.ref }}
+      - if: contains(github.ref, 'main')
         run: |
           sam build --config-env prod
           sam deploy --config-env prod --no-confirm-changeset --no-fail-on-empty-changeset
-      - if: contains(env.GITHUB_REF, '/feature')
+      - if: contains(github.ref, 'feature')
         run: |
           sam build --config-env dev
           sam deploy --config-env dev --no-confirm-changeset --no-fail-on-empty-changeset
