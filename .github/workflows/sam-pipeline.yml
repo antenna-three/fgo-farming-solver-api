@@ -1,0 +1,28 @@
+on:
+  push:
+    branches:
+      - main
+      - feature/*
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+      - uses: aws-actions/setup-sam@v1
+      - uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1
+      - if: contains(env.GITHUB_REF, '/main')
+        run: |
+          sam build --config-env prod
+          sam deploy --config-env prod --no-confirm-changeset --no-fail-on-empty-changeset
+      - if: contains(env.GITHUB_REF, '/feature')
+        run: |
+          sam build --config-env dev
+          sam deploy --config-env dev --no-confirm-changeset --no-fail-on-empty-changeset

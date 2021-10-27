@@ -10,55 +10,63 @@ Globals:
   Function:
     Timeout: 30
 
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+
+Mappings:
+  Bucket:
+    dev:
+      Name: fgodrop
+    prod:
+      Name: fgodrop
+  Table:
+    dev:
+      Name: fgo-farming-solver-results
+    prod:
+      Name: fgo-farming-solver_results
+  Api:
+    dev:
+      StageName: dev
+    prod:
+      StageName: prod
+
 Resources:
   FgoFarmingSolverFunction:
     Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
     Properties:
       CodeUri: fgo_farming_solver/
       Handler: main.handler
-      Runtime: python3.8
+      Runtime: python3.9
       Environment:
         Variables:
-          BUCKET_NAME: fgodrop
-          TABLE_NAME: fgo-farming-solver-results
+          BUCKET_NAME: !FindInMap [Bucket, !Ref Env, Name]
+          TABLE_NAME: !FindInMap [Table, !Ref Env, Name]
       Events:
-        FgoFarmingSolver:
+        FgoFarmingSolverApi:
           Type: HttpApi # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
           Properties:
-            Path: /fgo-farming-solver
-            Method: get
+            ApiId: !Ref FgoFarmingSolverApi
+            Path: /
+            Method: GET
       MemorySize: 1024
       Policies:
         - S3ReadPolicy:
-            BucketName: fgodrop
+            BucketName: !FindInMap [Bucket, !Ref Env, Name]
         - DynamoDBWritePolicy:
-            TableName: fgo-farming-solver-results
-  FgoFarmingSolverResultsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: fgo-farming-solver-results
-      AttributeDefinitions:
-        - AttributeName: id
-          AttributeType: S
-      KeySchema:
-        - AttributeName: id
-          KeyType: HASH
-      BillingMode: PROVISIONED
-      ProvisionedThroughput:
-        ReadCapacityUnits: 10
-        WriteCapacityUnits: 10
-          
+            TableName: !FindInMap [Table, !Ref Env, Name]
 
 Outputs:
   # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
   # Find out more about other implicit resources you can reference within SAM
   # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
-  FgoFarmingSolverApi:
-    Description: "API Gateway endpoint URL for Prod stage for Fgo Farming Solver function"
-    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/fgo-farming-solver"
   FgoFarmingSolverFunction:
-    Description: "Fgo Farming Solver Lambda Function ARN"
+    Description: 'Fgo Farming Solver Lambda Function ARN'
     Value: !GetAtt FgoFarmingSolverFunction.Arn
   FgoFarmingSolverFunctionRole:
-    Description: "Implicit IAM Role created for Fgo Farming Solver function"
+    Description: 'Implicit IAM Role created for Fgo Farming Solver function'
     Value: !GetAtt FgoFarmingSolverFunctionRole.Arn

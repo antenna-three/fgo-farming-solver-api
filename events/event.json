@@ -5,10 +5,11 @@
   "httpMethod": "GET",
   "isBase64Encoded": false,
   "queryStringParameters": {
-    "fields": "quests,items,id",
+    "fields": "quests,items",
     "objective": "ap",
     "items": "00:100,01:100,02:100,03:100,08:100",
-    "ap_coefficients": "0:0.5"
+    "ap_coefficients": "0:0.5",
+    "drop_merge_method": "add"
   },
   "pathParameters": {
     "proxy": "/path/to/resource"
